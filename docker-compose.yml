@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: trustlens-postgres
+    environment:
+      POSTGRES_DB: trustlens
+      POSTGRES_USER: trustlens
+      POSTGRES_PASSWORD: trustlens
+    ports:
+      - "5432:5432"
+    volumes:
+      - trustlens-postgres-data:/var/lib/postgresql/data
+      - ./backend/scripts/init_extensions.sql:/docker-entrypoint-initdb.d/init_extensions.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trustlens -d trustlens"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  trustlens-postgres-data:
