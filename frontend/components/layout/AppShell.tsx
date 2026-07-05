@@ -11,7 +11,7 @@ export function AppShell({
   breadcrumbs,
   children,
 }: {
-  breadcrumbs: BreadcrumbItem[];
+  breadcrumbs?: BreadcrumbItem[];
   children: React.ReactNode;
 }) {
   const [mobileOpen, setMobileOpen] = useState(false);

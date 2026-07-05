@@ -73,9 +73,9 @@ export default function HomePage() {
   }
 
   return (
-    <AppShell breadcrumbs={[{ label: "Home", href: "/" }, { label: "질문 입력 페이지" }]}>
+    <AppShell>
       <div className="mx-auto flex max-w-4xl flex-col gap-6">
-        <div className="text-center sm:text-left">
+        <div className="text-center">
           <h1 className="text-2xl font-bold text-slate-900 sm:text-3xl">
             AI 답변을 검증하고 더 신뢰할 수 있는 정보를 얻으세요
           </h1>

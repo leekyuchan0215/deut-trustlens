@@ -1,7 +1,7 @@
 @import "tailwindcss";
 
 :root {
-  --background: #f4f7fb;
+  --background: #e4edf6;
   --foreground: #0f172a;
 }
 
@@ -19,9 +19,10 @@ body {
 
 .app-gradient-bg {
   background-image:
-    radial-gradient(1200px 600px at 10% -10%, rgba(45, 212, 191, 0.12), transparent 60%),
-    radial-gradient(900px 500px at 100% 0%, rgba(251, 191, 36, 0.1), transparent 55%),
-    linear-gradient(180deg, #eef4fb 0%, #f6f2ea 100%);
+    radial-gradient(1100px 620px at 8% -5%, rgba(45, 212, 191, 0.28), transparent 58%),
+    radial-gradient(880px 520px at 98% 2%, rgba(251, 191, 36, 0.22), transparent 52%),
+    radial-gradient(700px 400px at 50% 100%, rgba(148, 163, 184, 0.12), transparent 55%),
+    linear-gradient(180deg, #dce8f4 0%, #e8eef6 38%, #f2ebe0 100%);
 }
 
 .scrollbar-thin {
