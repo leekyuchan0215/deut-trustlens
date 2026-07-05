@@ -1,14 +1,12 @@
-from datetime import datetime, timezone
-
 from fastapi import APIRouter, BackgroundTasks, Depends
 from sqlalchemy.orm import Session
 
+from app.agents.question_agent import analyze_question as analyze_question_llm
 from app.core.config import get_settings
-from app.core.errors import ApiError
 from app.db.session import get_db
 from app.models import Question
 from app.schemas.analyze import AnalyzeRequest, AnalyzeResponse
-from app.services import mock_pipeline
+from app.services import mock_pipeline, real_pipeline
 from app.services.question_analysis import classify_question, extract_keywords
 
 router = APIRouter(tags=["analyze"])
@@ -21,15 +19,16 @@ def create_analysis(
     db: Session = Depends(get_db),
 ) -> AnalyzeResponse:
     settings = get_settings()
-    if not settings.use_mock:
-        raise ApiError(
-            code="REAL_MODE_NOT_IMPLEMENTED",
-            message="Real Mode는 아직 구현되지 않았습니다. USE_MOCK=true로 실행해 주세요.",
-            status_code=503,
-        )
+    use_mock = settings.use_mock
 
-    question_type, verification_basis = classify_question(payload.question)
-    keywords = extract_keywords(payload.question)
+    if use_mock:
+        question_type, verification_basis = classify_question(payload.question)
+        keywords = extract_keywords(payload.question)
+    else:
+        analysis, _mode = analyze_question_llm(payload.question, payload.answer_purpose)
+        question_type = analysis.question_type
+        verification_basis = analysis.verification_basis
+        keywords = analysis.suggested_keywords
 
     question = Question(
         original_question=payload.original_question,
@@ -45,13 +44,14 @@ def create_analysis(
         display_stage="question_analysis",
         progress_percent=0,
         stage_details=[],
-        execution_mode="mock",
+        execution_mode="mock" if use_mock else "real",
     )
     db.add(question)
     db.commit()
     db.refresh(question)
 
-    background_tasks.add_task(mock_pipeline.run_pipeline, str(question.id))
+    pipeline = mock_pipeline if use_mock else real_pipeline
+    background_tasks.add_task(pipeline.run_pipeline, str(question.id))
 
     return AnalyzeResponse(
         question_id=str(question.id),

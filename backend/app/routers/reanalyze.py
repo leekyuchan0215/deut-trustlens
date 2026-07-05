@@ -7,7 +7,7 @@ from app.core.uuid_utils import parse_question_id
 from app.db.session import get_db
 from app.models import Question
 from app.schemas.analyze import ReanalyzeRequest, ReanalyzeResponse
-from app.services import mock_pipeline
+from app.services import mock_pipeline, real_pipeline
 
 router = APIRouter(tags=["reanalyze"])
 
@@ -20,12 +20,7 @@ def reanalyze(
     db: Session = Depends(get_db),
 ) -> ReanalyzeResponse:
     settings = get_settings()
-    if not settings.use_mock:
-        raise ApiError(
-            code="REAL_MODE_NOT_IMPLEMENTED",
-            message="Real Mode는 아직 구현되지 않았습니다. USE_MOCK=true로 실행해 주세요.",
-            status_code=503,
-        )
+    use_mock = settings.use_mock
 
     original = db.get(Question, parse_question_id(question_id))
     if original is None:
@@ -51,14 +46,15 @@ def reanalyze(
         display_stage="question_analysis",
         progress_percent=0,
         stage_details=[],
-        execution_mode="mock",
+        execution_mode="mock" if use_mock else "real",
         reanalysis_of_question_id=original.id,
     )
     db.add(new_question)
     db.commit()
     db.refresh(new_question)
 
-    background_tasks.add_task(mock_pipeline.run_pipeline, str(new_question.id))
+    pipeline = mock_pipeline if use_mock else real_pipeline
+    background_tasks.add_task(pipeline.run_pipeline, str(new_question.id))
 
     return ReanalyzeResponse(
         original_question_id=str(original.id),

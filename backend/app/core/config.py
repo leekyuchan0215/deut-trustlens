@@ -31,6 +31,12 @@ class Settings(BaseSettings):
 
     frontend_origin: str = "http://localhost:3000"
 
+    provider_timeout_seconds: float = 45.0
+    provider_max_retries: int = 2
+    tavily_max_results_per_query: int = 5
+    embedding_batch_size: int = 64
+    chunk_max_chars: int = 1200
+
 
 @lru_cache
 def get_settings() -> Settings:
