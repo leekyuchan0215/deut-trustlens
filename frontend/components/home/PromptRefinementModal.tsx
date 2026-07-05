@@ -26,21 +26,26 @@ export function PromptRefinementModal({
   useEffect(() => {
     document.body.style.overflow = "hidden";
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape" && !submitting) onClose();
     };
     document.addEventListener("keydown", onKey);
     return () => {
       document.body.style.overflow = "";
       document.removeEventListener("keydown", onKey);
     };
-  }, [onClose]);
+  }, [onClose, submitting]);
 
   useEffect(() => {
     dialogRef.current?.focus();
   }, []);
 
   return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-sm">
+    <div
+      className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-sm"
+      onClick={() => {
+        if (!submitting) onClose();
+      }}
+    >
       <div
         ref={dialogRef}
         role="dialog"
@@ -48,6 +53,7 @@ export function PromptRefinementModal({
         aria-labelledby="refine-modal-title"
         tabIndex={-1}
         className="w-full max-w-2xl rounded-2xl bg-white p-6 shadow-2xl outline-none sm:p-8"
+        onClick={(e) => e.stopPropagation()}
         onKeyDown={(e) => e.stopPropagation()}
       >
         <div className="mb-1 flex items-start justify-between">
