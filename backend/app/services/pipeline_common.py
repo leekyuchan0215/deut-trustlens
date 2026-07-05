@@ -55,6 +55,27 @@ def advance_stage(
     db.commit()
 
 
+def build_claim_evidence_relations(claims: list, evidences: list) -> list[dict]:
+    """Group evidences by claim into the shape app/schemas/common.py::
+    ClaimEvidenceRelationObject and frontend lib/types.ts::ClaimEvidenceRelation
+    expect: one entry per claim with a nested evidences[] list, not one flat
+    entry per (claim, evidence) pair."""
+    evidences_by_claim: dict = {}
+    for e in evidences:
+        evidences_by_claim.setdefault(e.claim_id, []).append(
+            {"evidence_id": str(e.id), "title": e.title, "domain": e.domain}
+        )
+    return [
+        {
+            "claim_id": str(c.id),
+            "claim_text": c.claim_text,
+            "verification_status": c.verification_status,
+            "evidences": evidences_by_claim.get(c.id, []),
+        }
+        for c in claims
+    ]
+
+
 def mark_failed(db: Session, question_id: str, error_code: str, error_message: str) -> None:
     question = db.get(Question, question_id)
     if question is None:

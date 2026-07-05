@@ -153,16 +153,26 @@ export function SummaryTab({
                   </span>
                   <span className="text-sm font-semibold text-slate-900">{ms.model_name}</span>
                 </div>
-                <div className="mb-2 flex items-baseline gap-2">
-                  <span className="text-2xl font-bold text-slate-900">{ms.score}</span>
-                  <span className="text-xs text-slate-400">/100</span>
-                  <span
-                    className={`ml-auto rounded-full px-2 py-0.5 text-xs font-medium ${scoreBadgeClasses(ms.score)}`}
-                  >
-                    {ms.grade}
-                  </span>
-                </div>
-                <p className="text-xs leading-relaxed text-slate-500">{ms.reason}</p>
+                {ms.score === null ? (
+                  <div className="mb-2 flex items-baseline gap-2">
+                    <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-500 ring-1 ring-slate-200">
+                      응답 실패
+                    </span>
+                  </div>
+                ) : (
+                  <div className="mb-2 flex items-baseline gap-2">
+                    <span className="text-2xl font-bold text-slate-900">{ms.score}</span>
+                    <span className="text-xs text-slate-400">/100</span>
+                    <span
+                      className={`ml-auto rounded-full px-2 py-0.5 text-xs font-medium ${scoreBadgeClasses(ms.score)}`}
+                    >
+                      {ms.grade}
+                    </span>
+                  </div>
+                )}
+                <p className="text-xs leading-relaxed text-slate-500">
+                  {ms.reason ?? "해당 모델 응답 생성에 실패하여 점수를 산정할 수 없습니다."}
+                </p>
               </Card>
             );
           })}

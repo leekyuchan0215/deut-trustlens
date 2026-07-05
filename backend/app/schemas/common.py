@@ -96,6 +96,19 @@ class EvidenceObject(BaseModel):
     rank: int
 
 
+class ClaimEvidenceRelationEvidenceRef(BaseModel):
+    evidence_id: str
+    title: str
+    domain: str | None = None
+
+
+class ClaimEvidenceRelationObject(BaseModel):
+    claim_id: str
+    claim_text: str
+    verification_status: str
+    evidences: list[ClaimEvidenceRelationEvidenceRef] = []
+
+
 class CrossReviewSemanticConsensus(BaseModel):
     claim_id: str
     meaning: str

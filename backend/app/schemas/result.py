@@ -4,6 +4,7 @@ from pydantic import BaseModel
 
 from app.schemas.common import (
     AIResponseObject,
+    ClaimEvidenceRelationObject,
     ClaimObject,
     ClaimSummary,
     CrossReviewObject,
@@ -59,7 +60,7 @@ class ResultDetailResponse(BaseModel):
     trust_score_breakdown: TrustScoreBreakdown
     source_summary: SourceSummary
     claim_distribution: dict
-    claim_evidence_relations: list[dict]
+    claim_evidence_relations: list[ClaimEvidenceRelationObject]
     final_result: FinalResultObject
     created_at: datetime
     completed_at: datetime | None = None

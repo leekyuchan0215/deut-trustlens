@@ -36,11 +36,13 @@ from app.models import (
 from app.services import deterministic_verification as detcheck
 from app.services import hybrid_search
 from app.services import tavily_service
+from app.core.config import get_settings
 from app.services.chunking import chunk_text
 from app.services.embedding_service import EmbeddingService
 from app.services.llm.base import LLMClient, ProviderError
 from app.services.llm.router import get_judge_client
 from app.services.pipeline_common import advance_stage as _advance
+from app.services.pipeline_common import build_claim_evidence_relations
 from app.services.pipeline_common import mark_failed as _mark_failed
 from app.services.trust_score_calculator import ClaimScoreInput, calculate_model_score, calculate_trust_score
 from app.utils.enums import PIPELINE_STEPS
@@ -52,12 +54,23 @@ CORE_CONSENSUS_BY_PROVIDER_COUNT = {3: 100.0, 2: 85.0, 1: 40.0}
 MAX_PARALLEL_CLAIM_WORKERS = 5
 
 
+def _trim_claims_for_fast_mode(claims: list[Claim]) -> list[Claim]:
+    settings = get_settings()
+    if not settings.pipeline_fast_mode or len(claims) <= settings.fast_mode_max_claims:
+        return claims
+    core = [c for c in claims if c.importance == "core"]
+    supporting = [c for c in claims if c.importance != "core"]
+    return (core + supporting)[: settings.fast_mode_max_claims]
+
+
 def _parallel_for_each(items: list, fn) -> None:
     """Run fn(item) for each item concurrently (pure-LLM calls only — no
     shared DB session may be touched inside fn)."""
     if not items:
         return
-    with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_CLAIM_WORKERS, len(items))) as pool:
+    settings = get_settings()
+    workers = 8 if settings.pipeline_fast_mode else MAX_PARALLEL_CLAIM_WORKERS
+    with ThreadPoolExecutor(max_workers=min(workers, len(items))) as pool:
         list(pool.map(fn, items))
 
 
@@ -81,6 +94,30 @@ class ClaimContext:
         self.deterministic_result: detcheck.DeterministicResult | None = None
         self.evidences: list[Evidence] = []
         self.verification_mode: str = "pending"
+
+
+def _web_search_contexts(claim_ctx_by_id: dict[uuid.UUID, ClaimContext]) -> list[ClaimContext]:
+    """Claims that still need Tavily + hybrid retrieval."""
+    settings = get_settings()
+    ctxs = [
+        ctx
+        for ctx in claim_ctx_by_id.values()
+        if ctx.verification_mode != "resolved"
+        and (
+            getattr(ctx, "requires_web_search", False)
+            or ctx.claim.verification_basis in ("authoritative_fact", "web_evidence", "mixed")
+        )
+    ]
+    if not settings.pipeline_fast_mode:
+        return ctxs
+    core_ctxs = [ctx for ctx in ctxs if ctx.claim.importance == "core"]
+    other_ctxs = [ctx for ctx in ctxs if ctx.claim.importance != "core"]
+    selected = (core_ctxs + other_ctxs)[: settings.fast_mode_max_web_claims]
+    selected_ids = {ctx.claim.id for ctx in selected}
+    for ctx in claim_ctx_by_id.values():
+        if ctx.claim.id not in selected_ids:
+            ctx.requires_web_search = False
+    return selected
 
 
 def _run(db: Session, question_id: str) -> None:
@@ -129,6 +166,7 @@ def _run(db: Session, question_id: str) -> None:
 
         elif stage == "claim_consolidation":
             claims = _run_claim_consolidation(db, judge_client, question, claims_by_provider, fallback_notes)
+            claims = _trim_claims_for_fast_mode(claims)
             claim_ctx_by_id = {c.id: ClaimContext(c) for c in claims}
             if not claims:
                 _mark_failed(
@@ -294,8 +332,15 @@ def _run_claim_consolidation(
     provider_count = len([p for p in claims_by_provider if claims_by_provider[p]])
     consensus_ceiling = CORE_CONSENSUS_BY_PROVIDER_COUNT.get(min(3, max(1, provider_count)), 40.0)
     for row in rows:
-        agree_count = len(row.source_models) if row.source_models else 1
-        base = 100.0 if agree_count >= max(1, provider_count) else 60.0 + 20.0 * agree_count
+        agree_count = len(row.source_models) if row.source_models else 0
+        if agree_count >= provider_count:
+            base = 100.0
+        elif agree_count >= 2:
+            base = 94.0
+        elif agree_count == 1:
+            base = 78.0
+        else:
+            base = 60.0
         row.consensus_score = round(min(consensus_ceiling, base), 2)
         row.consensus_level = "high" if row.consensus_score >= 85 else ("medium" if row.consensus_score >= 60 else "low")
     db.flush()
@@ -422,11 +467,8 @@ def _run_deterministic_verification(
 def _run_search_query_generation(
     judge_client: LLMClient, claim_ctx_by_id: dict, question: Question, fallback_notes: list[str]
 ) -> None:
-    target_ctxs = [
-        ctx for ctx in claim_ctx_by_id.values()
-        if ctx.verification_mode != "resolved"
-        and (ctx.requires_web_search or ctx.claim.verification_basis in ("authoritative_fact", "web_evidence", "mixed"))
-    ]
+    target_ctxs = _web_search_contexts(claim_ctx_by_id)
+    fast_mode = get_settings().pipeline_fast_mode
 
     def _generate(ctx: ClaimContext) -> None:
         parsed, meta = verification_agent.generate_search_queries(judge_client, ctx.claim.claim_text, ctx.claim.verification_basis)
@@ -439,6 +481,9 @@ def _run_search_query_generation(
             ctx.keyword_queries = [ctx.claim.normalized_claim[:80]]
             ctx.semantic_queries = [ctx.claim.normalized_claim]
             ctx.recency_required = question.question_type == "current_information"
+        if fast_mode:
+            ctx.keyword_queries = ctx.keyword_queries[:1]
+            ctx.semantic_queries = ctx.semantic_queries[:1]
         ctx.requires_web_search = True
 
     _parallel_for_each(target_ctxs, _generate)
@@ -449,9 +494,7 @@ def _run_evidence_search(
 ) -> list[SearchDocument]:
     all_queries: set[str] = set()
     any_recency = False
-    for ctx in claim_ctx_by_id.values():
-        if not getattr(ctx, "requires_web_search", False) or ctx.verification_mode == "resolved":
-            continue
+    for ctx in _web_search_contexts(claim_ctx_by_id):
         all_queries.update(getattr(ctx, "keyword_queries", []))
         all_queries.update(getattr(ctx, "semantic_queries", []))
         any_recency = any_recency or getattr(ctx, "recency_required", False)
@@ -545,9 +588,12 @@ def _run_evidence_selection(
         pass
 
     target_ctxs = [
-        ctx for ctx in claim_ctx_by_id.values()
-        if ctx.verification_mode != "resolved" and getattr(ctx, "requires_web_search", False)
+        ctx for ctx in _web_search_contexts(claim_ctx_by_id)
+        if getattr(ctx, "requires_web_search", False)
     ]
+    fast_mode = get_settings().pipeline_fast_mode
+    hybrid_top_k = get_settings().fast_mode_hybrid_top_k if fast_mode else 5
+    evidence_fallback_limit = 2 if fast_mode else 3
 
     # Phase 1 (parallel): each worker opens its own short-lived read session
     # for hybrid_search — the shared `db` session is never touched off-thread.
@@ -565,7 +611,7 @@ def _run_evidence_selection(
         local_db = SessionLocal()
         try:
             candidates = hybrid_search.search(
-                local_db, question.id, getattr(ctx, "keyword_queries", []), query_embeddings, top_k=5
+                local_db, question.id, getattr(ctx, "keyword_queries", []), query_embeddings, top_k=hybrid_top_k
             )
             resolved = [
                 {
@@ -597,7 +643,11 @@ def _run_evidence_selection(
              "vector_score": r["vector_score"], "hybrid_score": r["hybrid_score"]}
             for r in resolved
         ]
-        parsed, meta = verification_agent.evaluate_evidence(judge_client, ctx.claim.claim_text, candidate_dicts)
+        parsed, meta = (
+            (None, {"error": "fast_mode_score_fallback"})
+            if fast_mode
+            else verification_agent.evaluate_evidence(judge_client, ctx.claim.claim_text, candidate_dicts)
+        )
         prepared[ctx.claim.id] = (resolved, parsed)
 
     _parallel_for_each(target_ctxs, _prepare)
@@ -644,7 +694,7 @@ def _run_evidence_selection(
                 )
         else:
             fallback_notes.append(f"evidence_evaluation_failed:{ctx.claim.display_id}")
-            for rank, r in enumerate(resolved[:3], start=1):
+            for rank, r in enumerate(resolved[:evidence_fallback_limit], start=1):
                 quality = quality_for_source_type(r["source_type"])
                 support = round(min(100.0, quality * r["hybrid_score"]), 2)
                 rows.append(
@@ -698,9 +748,12 @@ def _run_claim_verification(judge_client: LLMClient, claim_ctx_by_id: dict, fall
             for e in ctx.evidences
         ]
 
-        parsed, meta = verification_agent.verify_claim(
-            judge_client, ctx.claim.claim_text, ctx.claim.verification_basis, None, evidence_dicts
-        )
+        if get_settings().pipeline_fast_mode:
+            parsed, meta = None, {}
+        else:
+            parsed, meta = verification_agent.verify_claim(
+                judge_client, ctx.claim.claim_text, ctx.claim.verification_basis, None, evidence_dicts
+            )
         if parsed is not None:
             ctx.claim.verification_status = parsed.verification_status
             ctx.claim.verification_confidence = parsed.verification_confidence
@@ -810,6 +863,39 @@ def _run_cross_review(
     return fallback_review, "rule_fallback"
 
 
+_CONSENSUS_LEVEL_SCORE = {"high": 98.0, "medium": 88.0, "low": 72.0}
+_LOGIC_ISSUE_IGNORE_KEYWORDS = ("미언급", "생략", "missing", "언급하지", "추가 설명", "설명하지 않")
+
+
+def _sync_consensus_from_cross_review(claims: list[Claim], cross_review: dict) -> None:
+    """Cross Review semantic consensus overrides claim-level scores when models agree on meaning."""
+    by_id = {str(c.id): c for c in claims}
+    by_display = {c.display_id: c for c in claims}
+    for item in cross_review.get("semantic_consensus", []):
+        claim = by_id.get(str(item.get("claim_id"))) or by_display.get(str(item.get("claim_id")))
+        if claim is None:
+            continue
+        agreeing = len(item.get("agreeing_models") or [])
+        level_score = _CONSENSUS_LEVEL_SCORE.get(str(item.get("consensus_level") or "medium"), 88.0)
+        if agreeing >= 3:
+            level_score = max(level_score, 98.0)
+        elif agreeing >= 2:
+            level_score = max(level_score, 92.0)
+        claim.consensus_score = round(max(claim.consensus_score or 0.0, level_score), 2)
+        claim.consensus_level = "high" if claim.consensus_score >= 85 else ("medium" if claim.consensus_score >= 60 else "low")
+
+
+def _filtered_logic_issue_count(cross_review: dict) -> int:
+    issues = cross_review.get("logic_issues") or []
+    filtered = []
+    for issue in issues:
+        text = issue if isinstance(issue, str) else str(issue)
+        if any(keyword in text for keyword in _LOGIC_ISSUE_IGNORE_KEYWORDS):
+            continue
+        filtered.append(text)
+    return len(filtered)
+
+
 _RISK_PENALTY_BY_LEVEL = {"low": 0.0, "medium": 5.0, "high": 15.0}
 _CONTRADICTION_PENALTY_BY_LEVEL = {"low": 3.0, "medium": 15.0, "high": 25.0}
 
@@ -878,6 +964,14 @@ def _run_risk_analysis(
             penalty = _RISK_PENALTY_BY_LEVEL.get(level, 0.0)
         if item.get("resolved_by_evidence"):
             penalty = 0.0
+        if get_settings().trust_score_generous_mode:
+            if not item.get("affects_core_answer") and item["risk_type"] in (
+                "hallucination",
+                "source_credibility",
+            ):
+                penalty = 0.0
+            elif item["risk_type"] != "contradiction":
+                penalty = round(penalty * 0.35, 2)
 
         rows.append(
             Risk(
@@ -941,14 +1035,15 @@ def _run_final_answer_and_reflection(
 
     parsed = _sanitize(parsed)
 
-    reflection_parsed, reflection_meta = reflection_agent.reflect(
-        judge_client, question.selected_question, parsed, claim_dicts, verification_dicts, evidence_dicts
-    )
-    attempts += 1
-    if reflection_parsed is not None and not reflection_parsed.passed and reflection_parsed.revised is not None:
-        parsed = _sanitize(reflection_parsed.revised)
-    elif reflection_parsed is None:
-        fallback_notes.append(f"reflection_failed:{reflection_meta.get('error')}")
+    if not get_settings().pipeline_fast_mode:
+        reflection_parsed, reflection_meta = reflection_agent.reflect(
+            judge_client, question.selected_question, parsed, claim_dicts, verification_dicts, evidence_dicts
+        )
+        attempts += 1
+        if reflection_parsed is not None and not reflection_parsed.passed and reflection_parsed.revised is not None:
+            parsed = _sanitize(reflection_parsed.revised)
+        elif reflection_parsed is None:
+            fallback_notes.append(f"reflection_failed:{reflection_meta.get('error')}")
 
     return parsed, "llm_judge", attempts
 
@@ -983,6 +1078,8 @@ def _finalize(
     cross_review: dict, cross_review_mode: str, final_answer_output: FinalAnswerOutput,
     final_answer_mode: str, judge_attempts: int, fallback_notes: list[str],
 ) -> None:
+    _sync_consensus_from_cross_review(claims, cross_review)
+
     claim_inputs = []
     evidence_quality_by_claim: dict = {}
     for evidence in evidences:
@@ -1001,10 +1098,15 @@ def _finalize(
             )
         )
 
-    logic_issue_count = len(cross_review.get("logic_issues", []))
+    logic_issue_count = _filtered_logic_issue_count(cross_review)
     outdated_risk_count = len([r for r in risks if r.risk_type == "outdated_information" and r.penalty > 0])
     contradiction_penalty = min(30.0, sum(float(r.penalty) for r in risks if r.risk_type == "contradiction"))
     risk_penalty = min(40.0, sum(float(r.penalty) for r in risks if r.risk_type != "contradiction"))
+    if get_settings().trust_score_generous_mode:
+        claim_consensus_avg = mean(float(c.consensus_score or 0) for c in claims) if claims else 0.0
+        if claim_consensus_avg >= 88:
+            risk_penalty = round(risk_penalty * 0.5, 2)
+        risk_penalty = min(risk_penalty, 8.0)
 
     score = calculate_trust_score(
         claims=claim_inputs,
@@ -1014,6 +1116,7 @@ def _finalize(
         outdated_risk_count=outdated_risk_count,
         question_type=question.question_type or "general",
         verification_basis=question.verification_basis or "mixed",
+        answer_purpose=question.answer_purpose or "concept_understanding",
     )
 
     claims_by_provider: dict[str, list[ClaimScoreInput]] = {}
@@ -1057,9 +1160,7 @@ def _finalize(
         "unsupported": len([c for c in claims if c.verification_status == "unsupported"]),
         "contradicted": len([c for c in claims if c.verification_status == "contradicted"]),
     }
-    claim_evidence_relations = [
-        {"claim_id": str(e.claim_id), "evidence_id": str(e.id), "relation": e.relation} for e in evidences
-    ]
+    claim_evidence_relations = build_claim_evidence_relations(claims, evidences)
     source_summary = {
         "total_documents": len(documents),
         "used_evidences": len(evidences),

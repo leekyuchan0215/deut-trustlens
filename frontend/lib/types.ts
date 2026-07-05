@@ -280,9 +280,9 @@ export interface TrustScoreBreakdown {
 export interface ModelScore {
   provider: Provider;
   model_name: string;
-  score: number;
-  grade: string;
-  reason: string;
+  score: number | null;
+  grade: string | null;
+  reason: string | null;
 }
 
 // ---------- Claim summary / source summary ----------

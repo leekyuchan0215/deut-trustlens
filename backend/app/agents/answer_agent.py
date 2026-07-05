@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from app.agents.prompts import ANSWER_GENERATION_SYSTEM, answer_generation_prompt
+from app.core.config import get_settings
 from app.services.llm.base import ProviderError
 from app.services.llm.router import get_client
 
@@ -61,7 +62,7 @@ def _generate_one(
         result = client.chat(
             ANSWER_GENERATION_SYSTEM,
             answer_generation_prompt(question, question_type, verification_basis, answer_purpose, current_date),
-            max_tokens=1500,
+            max_tokens=get_settings().answer_max_tokens,
         )
     except ProviderError as exc:
         return AnswerResult(

@@ -14,6 +14,7 @@ from app.agents.prompts import (
     claim_extraction_prompt,
 )
 from app.agents.schemas import ClaimConsolidationOutput, ClaimExtractionOutput
+from app.core.config import get_settings
 from app.services.llm.base import LLMClient, call_json
 
 logger = logging.getLogger("trustlens.agents.claim")
@@ -27,7 +28,7 @@ def extract_claims(
         CLAIM_EXTRACTION_SYSTEM,
         claim_extraction_prompt(question, provider, response_text),
         ClaimExtractionOutput,
-        max_tokens=3200,
+        max_tokens=1600 if get_settings().pipeline_fast_mode else 3200,
     )
     if parsed is not None and parsed.provider != provider:
         parsed.provider = provider
@@ -47,6 +48,6 @@ def consolidate_claims(
         CLAIM_CONSOLIDATION_SYSTEM,
         claim_consolidation_prompt(_dump("gpt"), _dump("claude"), _dump("gemini")),
         ClaimConsolidationOutput,
-        max_tokens=4000,
+        max_tokens=2000 if get_settings().pipeline_fast_mode else 4000,
     )
     return parsed, meta

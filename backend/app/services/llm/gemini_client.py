@@ -7,23 +7,40 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 from app.core.config import get_settings
 from app.services.llm.base import LLMCallResult, ProviderError
+from app.services.llm.openrouter_client import OpenRouterClient
 
 _RETRYABLE = (genai_errors.ServerError, genai_errors.ClientError)
 
 
 class GeminiClient:
+    """Direct Google Gemini API if GEMINI_API_KEY is set, else OpenRouter fallback."""
+
     provider = "gemini"
 
     def __init__(self):
         settings = get_settings()
-        if not settings.gemini_api_key:
-            raise ProviderError("gemini", "GEMINI_API_KEY가 설정되지 않았습니다.")
-        self._client = genai.Client(api_key=settings.gemini_api_key)
-        self.model_name = settings.gemini_model or "gemini-2.0-flash"
         self._max_retries = settings.provider_max_retries
         self._timeout_seconds = settings.provider_timeout_seconds
+        if settings.gemini_api_key:
+            self._mode = "google"
+            self._client = genai.Client(api_key=settings.gemini_api_key)
+            self.model_name = settings.gemini_model or "gemini-2.0-flash"
+        elif settings.openrouter_api_key:
+            self._mode = "openrouter"
+            model_name = settings.openrouter_gemini_model or "google/gemini-2.5-flash"
+            self._openrouter = OpenRouterClient(model_name=model_name)
+            self.model_name = self._openrouter.model_name
+        else:
+            raise ProviderError(
+                "gemini", "GEMINI_API_KEY 또는 OPENROUTER_API_KEY가 설정되지 않았습니다."
+            )
 
     def chat(self, system_prompt: str, user_prompt: str, max_tokens: int = 2000) -> LLMCallResult:
+        if self._mode == "google":
+            return self._chat_google(system_prompt, user_prompt, max_tokens)
+        return self._openrouter.chat(system_prompt, user_prompt, max_tokens)
+
+    def _chat_google(self, system_prompt: str, user_prompt: str, max_tokens: int) -> LLMCallResult:
         @retry(
             stop=stop_after_attempt(self._max_retries + 1),
             wait=wait_exponential(multiplier=1, min=1, max=8),

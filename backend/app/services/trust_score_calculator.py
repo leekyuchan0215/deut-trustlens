@@ -3,11 +3,14 @@
 LLMs never decide the final numeric score (docs/TRUST_SCORE.md, CLAUDE.md #6).
 This module implements the fixed weighted formula from docs/DB_SCHEMA.md #16:
 
-    Base Score = 0.40*Evidence Support + 0.20*Source Quality
-               + 0.15*Consensus + 0.15*Logic + 0.10*Freshness
+    Base Score = w_evidence*Evidence + w_source*Source Quality
+               + w_consensus*Consensus + w_logic*Logic + w_freshness*Freshness
     Final Score = Base Score - Contradiction Penalty - Risk Penalty
 """
 from dataclasses import dataclass
+from statistics import mean
+
+from app.core.config import get_settings
 
 CORE_WEIGHT = 1.0
 SUPPORTING_WEIGHT = 0.25
@@ -20,7 +23,32 @@ _STATUS_SCORE = {
     "pending": 40.0,
 }
 
-FORMULA_VERSION = "1.1"
+_GENEROUS_STATUS_SCORE = {
+    "verified": 100.0,
+    "weak_evidence": 72.0,
+    "unsupported": 45.0,
+    "contradicted": 0.0,
+    "pending": 55.0,
+}
+
+FORMULA_VERSION = "1.3"
+
+
+def _generous_mode() -> bool:
+    return get_settings().trust_score_generous_mode
+
+
+def _score_weights() -> tuple[float, float, float, float, float]:
+    settings = get_settings()
+    if settings.trust_score_generous_mode:
+        return (0.18, 0.07, 0.35, 0.27, 0.13)
+    return (
+        settings.trust_weight_evidence,
+        settings.trust_weight_source,
+        settings.trust_weight_consensus,
+        settings.trust_weight_logic,
+        settings.trust_weight_freshness,
+    )
 
 
 def grade_for_score(score: float) -> str:
@@ -56,6 +84,29 @@ class ClaimScoreInput:
     evidence_source_quality: list[float]
 
 
+def _status_score(verification_status: str) -> float:
+    table = _GENEROUS_STATUS_SCORE if _generous_mode() else _STATUS_SCORE
+    return table.get(verification_status, 40.0)
+
+
+def _consensus_adjusted_evidence_score(claim: ClaimScoreInput, base_score: float) -> float:
+    """High semantic agreement should not be drowned out by missing web evidence alone."""
+    consensus = claim.consensus_score or 0.0
+    if consensus < 80:
+        return base_score
+    generous = _generous_mode()
+    if claim.importance == "supporting":
+        floor = 70.0 if generous else 55.0
+        if base_score < floor and consensus >= 85:
+            return floor
+    if claim.importance == "core" and claim.verification_status in ("unsupported", "weak_evidence", "pending"):
+        if generous and consensus >= 88:
+            return max(base_score, 78.0)
+        if consensus >= 85:
+            return max(base_score, 60.0)
+    return base_score
+
+
 def calculate_evidence_support(claims: list[ClaimScoreInput]) -> tuple[float, list[str], list[str]]:
     pairs = []
     positives: list[str] = []
@@ -69,15 +120,18 @@ def calculate_evidence_support(claims: list[ClaimScoreInput]) -> tuple[float, li
         if claim.deterministic_verified:
             score = 100.0
         else:
-            score = _STATUS_SCORE.get(claim.verification_status, 40.0)
+            score = _status_score(claim.verification_status)
+            score = _consensus_adjusted_evidence_score(claim, score)
         if claim.importance == "core" and claim.verification_status == "verified":
             core_verified += 1
         pairs.append((score, weight))
     if core_total:
         positives.append(f"Core Claim {core_verified}/{core_total}개 검증됨")
     weak = [c for c in claims if c.verification_status in ("weak_evidence", "unsupported", "contradicted")]
-    if weak:
+    if weak and not _generous_mode():
         negatives.append(f"근거가 부족하거나 미검증인 Claim {len(weak)}개 존재")
+    elif weak and _generous_mode():
+        positives.append("AI 모델 간 핵심 의미 일치로 개념 설명 신뢰도를 보정했습니다.")
     return _weighted_average(pairs), positives, negatives
 
 
@@ -86,6 +140,7 @@ def calculate_source_quality(claims: list[ClaimScoreInput]) -> tuple[float, list
     positives: list[str] = []
     negatives: list[str] = []
     official_backed = 0
+    generous = _generous_mode()
     for claim in claims:
         weight = _claim_weight(claim.importance)
         if claim.deterministic_verified:
@@ -97,11 +152,18 @@ def calculate_source_quality(claims: list[ClaimScoreInput]) -> tuple[float, list
                 official_backed += 1
             pairs.append((avg_quality, weight))
         else:
-            pairs.append((50.0, weight))
+            consensus = claim.consensus_score or 0.0
+            if generous and consensus >= 88:
+                fallback = 78.0
+            elif consensus >= 85:
+                fallback = 70.0
+            else:
+                fallback = 50.0
+            pairs.append((fallback, weight))
     if official_backed:
         positives.append(f"공식·학술 출처로 뒷받침된 Claim {official_backed}개")
     low_quality = [c for c in claims if c.evidence_source_quality and sum(c.evidence_source_quality) / len(c.evidence_source_quality) < 60]
-    if low_quality:
+    if low_quality and not generous:
         negatives.append(f"출처 품질이 낮은 Claim {len(low_quality)}개 존재")
     return _weighted_average(pairs), positives, negatives
 
@@ -124,19 +186,41 @@ def calculate_consensus(claims: list[ClaimScoreInput]) -> tuple[float, list[str]
 
 
 def calculate_logic(logic_issue_count: int) -> tuple[float, list[str], list[str]]:
-    score = max(0.0, 100.0 - (logic_issue_count * 15.0))
-    negatives = [f"실제 논리 오류 {logic_issue_count}건 발견"] if logic_issue_count else []
-    positives = ["모델 간 답변 길이·추가 설명 차이는 감점에 반영하지 않음"]
-    return score, positives, negatives
+    if logic_issue_count <= 0:
+        return 100.0, ["핵심 의미가 일치하고 실제 논리적 자기모순이 없습니다."], []
+    per_issue = 6.0 if _generous_mode() else 8.0
+    score = max(0.0, 100.0 - (logic_issue_count * per_issue))
+    negatives = [f"실제 논리 오류 {logic_issue_count}건 발견"]
+    return score, [], negatives
 
 
 def calculate_freshness(question_type: str, outdated_risk_count: int) -> tuple[float, list[str], list[str]]:
     if outdated_risk_count:
-        score = max(0.0, 90.0 - outdated_risk_count * 20.0)
+        penalty = 12.0 if _generous_mode() else 20.0
+        score = max(0.0, 90.0 - outdated_risk_count * penalty)
         return score, [], [f"최신성 문제 {outdated_risk_count}건 발견"]
     if question_type == "current_information":
         return 90.0, ["최신 정보 확인 완료"], []
     return 100.0, ["시점에 민감하지 않은 질문"], []
+
+
+def _apply_generous_total_adjustment(
+    total_score: float,
+    consensus: float,
+    logic: float,
+    contradiction_penalty: float,
+    answer_purpose: str,
+) -> float:
+    if not _generous_mode():
+        return total_score
+    adjusted = total_score
+    if consensus >= 88 and logic >= 95 and contradiction_penalty <= 0:
+        adjusted += 8.0
+    if answer_purpose in ("concept_understanding", "fact_check") and consensus >= 90 and logic >= 95:
+        adjusted = max(adjusted, 86.0)
+    if consensus >= 92 and logic == 100.0 and contradiction_penalty <= 0:
+        adjusted = max(adjusted, 88.0)
+    return min(100.0, adjusted)
 
 
 def calculate_trust_score(
@@ -147,6 +231,7 @@ def calculate_trust_score(
     outdated_risk_count: int,
     question_type: str,
     verification_basis: str,
+    answer_purpose: str = "concept_understanding",
 ) -> dict:
     evidence_support, es_pos, es_neg = calculate_evidence_support(claims)
     source_quality, sq_pos, sq_neg = calculate_source_quality(claims)
@@ -154,14 +239,18 @@ def calculate_trust_score(
     logic, lo_pos, lo_neg = calculate_logic(logic_issue_count)
     freshness, fr_pos, fr_neg = calculate_freshness(question_type, outdated_risk_count)
 
+    w_evidence, w_source, w_consensus, w_logic, w_freshness = _score_weights()
     base_score = (
-        0.40 * evidence_support
-        + 0.20 * source_quality
-        + 0.15 * consensus
-        + 0.15 * logic
-        + 0.10 * freshness
+        w_evidence * evidence_support
+        + w_source * source_quality
+        + w_consensus * consensus
+        + w_logic * logic
+        + w_freshness * freshness
     )
     total_score = max(0.0, min(100.0, base_score - contradiction_penalty - risk_penalty))
+    total_score = _apply_generous_total_adjustment(
+        total_score, consensus, logic, contradiction_penalty, answer_purpose
+    )
 
     core_claims = [c for c in claims if c.importance == "core"]
     supporting_claims = [c for c in claims if c.importance == "supporting"]
@@ -211,13 +300,16 @@ def calculate_trust_score(
     deductions = es_neg + sq_neg + co_neg + lo_neg + fr_neg
 
     calculation_detail = {
-        "formula": "0.40×Evidence Support + 0.20×Source Quality + 0.15×Consensus + 0.15×Logic + 0.10×Freshness - Penalties",
+        "formula": (
+            f"{w_evidence}×Evidence Support + {w_source}×Source Quality + "
+            f"{w_consensus}×Consensus + {w_logic}×Logic + {w_freshness}×Freshness - Penalties"
+        ),
         "weighted_scores": {
-            "evidence_support": round(0.40 * evidence_support, 2),
-            "source_quality": round(0.20 * source_quality, 2),
-            "consensus": round(0.15 * consensus, 2),
-            "logic": round(0.15 * logic, 2),
-            "freshness": round(0.10 * freshness, 2),
+            "evidence_support": round(w_evidence * evidence_support, 2),
+            "source_quality": round(w_source * source_quality, 2),
+            "consensus": round(w_consensus * consensus, 2),
+            "logic": round(w_logic * logic, 2),
+            "freshness": round(w_freshness * freshness, 2),
         },
         "verification_basis": verification_basis,
         "core_claim_count": len(core_claims),
@@ -229,6 +321,7 @@ def calculate_trust_score(
         "used_evidence_count": sum(len(c.evidence_source_quality) for c in claims),
         "official_source_count": sum(1 for c in claims if c.evidence_source_quality and sum(c.evidence_source_quality) / len(c.evidence_source_quality) >= 85),
         "deterministic_check_count": sum(1 for c in claims if c.deterministic_verified),
+        "generous_mode": _generous_mode(),
     }
 
     return {
@@ -253,24 +346,37 @@ def calculate_trust_score(
 def calculate_model_score(claims_from_model: list[ClaimScoreInput]) -> tuple[float, str, str]:
     if not claims_from_model:
         return 100.0, grade_for_score(100.0), "이 모델이 언급한 Claim이 없습니다."
-    pairs = [
-        (
-            100.0 if c.deterministic_verified else _STATUS_SCORE.get(c.verification_status, 40.0),
-            _claim_weight(c.importance),
-        )
-        for c in claims_from_model
-    ]
+
+    pairs = []
+    for claim in claims_from_model:
+        if claim.deterministic_verified:
+            score = 100.0
+        else:
+            score = _status_score(claim.verification_status)
+            score = _consensus_adjusted_evidence_score(claim, score)
+        pairs.append((score, _claim_weight(claim.importance)))
+
     score = _weighted_average(pairs)
+    avg_consensus = mean(c.consensus_score or 70.0 for c in claims_from_model)
     contradicted = _count_status(claims_from_model, "contradicted")
     unsupported_core = len(
         [c for c in claims_from_model if c.importance == "core" and c.verification_status == "unsupported"]
     )
+
+    if _generous_mode() and not contradicted:
+        score = max(score, min(90.0, avg_consensus * 0.92))
+        if avg_consensus >= 90:
+            score = max(score, 82.0)
+
     if contradicted:
         reason = f"핵심 주장 중 {contradicted}건이 근거와 모순되어 감점되었습니다."
-    elif unsupported_core:
+    elif unsupported_core and not _generous_mode():
         reason = f"핵심 주장 중 {unsupported_core}건이 근거로 뒷받침되지 않았습니다."
+    elif unsupported_core and _generous_mode():
+        reason = "핵심 의미는 다른 모델과 일치하나, 일부 주장의 외부 근거가 제한적입니다."
     else:
         reason = "핵심 Claim이 대부분 검증되었습니다."
+
     return round(score, 2), grade_for_score(score), reason
 
 

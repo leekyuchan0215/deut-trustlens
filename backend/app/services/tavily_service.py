@@ -4,7 +4,7 @@ SearchDocument rows. Injected instructions inside returned content are never
 executed — they are treated purely as data by downstream agents."""
 import hashlib
 import logging
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -89,7 +89,12 @@ class TavilyService:
         if not settings.tavily_api_key:
             raise ProviderError("tavily", "TAVILY_API_KEY가 설정되지 않았습니다.")
         self._client = TavilyClient(api_key=settings.tavily_api_key)
-        self._max_results = settings.tavily_max_results_per_query
+        self._max_results = (
+            min(settings.tavily_max_results_per_query, 2)
+            if settings.pipeline_fast_mode
+            else settings.tavily_max_results_per_query
+        )
+        self._search_depth = "basic" if settings.pipeline_fast_mode else "advanced"
         self._max_retries = settings.provider_max_retries
 
     def search(self, query: str, recency_required: bool = False) -> list[TavilyResult]:
@@ -102,7 +107,7 @@ class TavilyService:
         def _call():
             return self._client.search(
                 query=query,
-                search_depth="advanced",
+                search_depth=self._search_depth,
                 max_results=self._max_results,
                 include_raw_content=False,
                 time_range="year" if recency_required else None,
@@ -135,19 +140,44 @@ class TavilyService:
 
 
 def search_many(queries: list[str], recency_required: bool = False) -> list[TavilyResult]:
-    """Search multiple queries, de-duplicating by URL. Any single-query
+    """Search multiple queries in parallel, de-duplicating by URL. Any single-query
     failure is logged and skipped rather than failing the whole batch."""
+    settings = get_settings()
     service = TavilyService()
+    unique_queries: list[str] = []
+    seen_queries: set[str] = set()
+    for query in queries:
+        normalized = query.strip()
+        if not normalized or normalized in seen_queries:
+            continue
+        seen_queries.add(normalized)
+        unique_queries.append(normalized)
+
+    if settings.pipeline_fast_mode:
+        unique_queries = unique_queries[: settings.fast_mode_tavily_max_queries]
+
+    if not unique_queries:
+        return []
+
     seen_urls: set[str] = set()
     results: list[TavilyResult] = []
-    for query in queries:
-        try:
-            for result in service.search(query, recency_required=recency_required):
+
+    def _search_one(query: str) -> list[TavilyResult]:
+        return service.search(query, recency_required=recency_required)
+
+    max_workers = min(6, len(unique_queries))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_search_one, query): query for query in unique_queries}
+        for future in as_completed(futures):
+            query = futures[future]
+            try:
+                batch = future.result()
+            except ProviderError as exc:
+                logger.warning("tavily_query_failed query=%s error=%s", query, exc)
+                continue
+            for result in batch:
                 if result.url in seen_urls:
                     continue
                 seen_urls.add(result.url)
                 results.append(result)
-        except ProviderError as exc:
-            logger.warning("tavily_query_failed query=%s error=%s", query, exc)
-            continue
     return results

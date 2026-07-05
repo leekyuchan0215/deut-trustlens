@@ -14,6 +14,7 @@ from app.db.session import SessionLocal
 from app.models import Claim, FinalResult, Question, TrustScore
 from app.services import mock_data_generator as gen
 from app.services.pipeline_common import advance_stage as _advance
+from app.services.pipeline_common import build_claim_evidence_relations
 from app.services.pipeline_common import mark_failed as _mark_failed
 from app.services.trust_score_calculator import ClaimScoreInput, calculate_model_score, calculate_trust_score
 from app.utils.enums import PIPELINE_STEPS
@@ -226,9 +227,7 @@ def _finalize(
         "contradicted": len([c for c in claims if c.verification_status == "contradicted"]),
     }
 
-    claim_evidence_relations = [
-        {"claim_id": str(e.claim_id), "evidence_id": str(e.id), "relation": e.relation} for e in evidences
-    ]
+    claim_evidence_relations = build_claim_evidence_relations(claims, evidences)
 
     source_summary = {
         "total_documents": len(documents),

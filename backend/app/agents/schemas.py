@@ -173,22 +173,53 @@ class MissingPointItem(BaseModel):
     affects_core_answer: bool = False
 
 
+def _stringify_review_items(items: list) -> list[str]:
+    """The Judge sometimes returns contradictions/overclaims/logic_issues as
+    structured objects (e.g. {"model": "claude", "claim": "..."}) instead of
+    plain strings, even though docs/API_SPEC.md #14 defines these as
+    list[str]. Normalize here so the stored result always matches the API
+    contract in app/schemas/common.py::CrossReviewObject."""
+    result = []
+    for item in items:
+        if isinstance(item, str):
+            result.append(item)
+        elif isinstance(item, dict):
+            text = item.get("claim") or item.get("description") or item.get("reason") or item.get("text")
+            model = item.get("model")
+            if text and model:
+                result.append(f"[{model}] {text}")
+            elif text:
+                result.append(str(text))
+            else:
+                result.append(", ".join(f"{k}: {v}" for k, v in item.items()))
+        else:
+            result.append(str(item))
+    return result
+
+
 class CrossReviewOutput(BaseModel):
     semantic_consensus: list[SemanticConsensusItem] = Field(default_factory=list)
     consensus: list[str] = Field(default_factory=list)
-    contradictions: list[dict] = Field(default_factory=list)
+    contradictions: list[str] = Field(default_factory=list)
     model_additions: dict[str, list[str]] = Field(
         default_factory=lambda: {"gpt": [], "claude": [], "gemini": []}
     )
     missing_points: list[MissingPointItem] = Field(default_factory=list)
-    overclaims: list[dict] = Field(default_factory=list)
-    logic_issues: list[dict] = Field(default_factory=list)
+    overclaims: list[str] = Field(default_factory=list)
+    logic_issues: list[str] = Field(default_factory=list)
     model_strengths: dict[str, list[str]] = Field(
         default_factory=lambda: {"gpt": [], "claude": [], "gemini": []}
     )
     model_weaknesses: dict[str, list[str]] = Field(
         default_factory=lambda: {"gpt": [], "claude": [], "gemini": []}
     )
+
+    @field_validator("contradictions", "overclaims", "logic_issues", mode="before")
+    @classmethod
+    def _normalize_review_items(cls, v):
+        if not isinstance(v, list):
+            return v
+        return _stringify_review_items(v)
 
 
 class RiskItem(BaseModel):

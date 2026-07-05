@@ -49,6 +49,19 @@ def test_full_mock_analysis_flow(client):
     assert len(detail["deterministic_checks"]) > 0
     assert all(c["check_passed"] for c in detail["deterministic_checks"])
 
+    # claim_evidence_relations must be grouped one-entry-per-claim with a
+    # nested evidences[] list (not one flat entry per claim/evidence pair) --
+    # this is the shape app/schemas/common.py::ClaimEvidenceRelationObject and
+    # the frontend's GraphTab rely on.
+    relations = detail["claim_evidence_relations"]
+    assert len(relations) == len(detail["claims"])
+    for relation in relations:
+        assert "claim_text" in relation
+        assert "verification_status" in relation
+        assert isinstance(relation["evidences"], list)
+        for evidence_ref in relation["evidences"]:
+            assert set(evidence_ref.keys()) == {"evidence_id", "title", "domain"}
+
     history_response = client.get("/api/history")
     assert history_response.status_code == 200
     history = history_response.json()

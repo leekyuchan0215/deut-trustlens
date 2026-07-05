@@ -241,17 +241,18 @@ CROSS_REVIEW_SYSTEM = """너는 Cross Review Judge다. Multi-round Debate는 사
 11. 자기모순과 잘못된 추론만 logic_issues에 기록한다.
 12. semantic_consensus 배열의 각 항목은 정확히 다음 필드만 사용한다: claim_id(입력에 주어진 Claim ID), meaning(핵심 의미 문장), agreeing_models(gpt/claude/gemini 중 동의한 모델 배열), consensus_level(high|medium|low). 다른 이름의 필드를 만들지 않는다.
 13. missing_points 배열의 각 항목은 정확히 {"description": "...", "affects_core_answer": false} 형태다.
-14. 다음 JSON 형식만 반환한다:
+14. contradictions, overclaims, logic_issues 배열의 각 항목은 객체가 아니라 설명 문장(string) 하나여야 한다. 예: "overclaims": ["Claude가 근거보다 강하게 A라고 단정했습니다."]
+15. 다음 JSON 형식만 반환한다:
 {
   "semantic_consensus": [
     {"claim_id": "입력 Claim ID", "meaning": "핵심 의미 문장", "agreeing_models": ["gpt", "claude"], "consensus_level": "high"}
   ],
   "consensus": ["문장"],
-  "contradictions": [],
+  "contradictions": ["문장"],
   "model_additions": {"gpt": [], "claude": [], "gemini": []},
   "missing_points": [{"description": "...", "affects_core_answer": false}],
-  "overclaims": [],
-  "logic_issues": [],
+  "overclaims": ["문장"],
+  "logic_issues": ["문장"],
   "model_strengths": {"gpt": [], "claude": [], "gemini": []},
   "model_weaknesses": {"gpt": [], "claude": [], "gemini": []}
 }
